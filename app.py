@@ -1,78 +1,41 @@
 from flask import Flask, request
 import requests
-from datetime import datetime, date
-import threading
-import time
+from datetime import datetime, date, time
+import os
 
 app = Flask(__name__)
 
-# ================== TELEGRAM ==================
+# ================= TELEGRAM =================
 BOT_TOKEN = "8272965030:AAERrS7zgQFpLVfLYTsaz81wG0wzYXh0FXg"
 CHAT_ID   = "1292725273"
 
 def send_telegram(msg):
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": msg}
-    )
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
-# ================== MARKET TIMES ==================
-MARKET_OPEN  = "10:00"
-MARKET_CLOSE = "14:30"
-
-# ================== DAILY FLAGS ==================
-OPEN_SENT   = False
-CLOSE_SENT  = False
+# ============== GLOBAL STATE ==============
 LAST_SIGNAL_DAY = None
-LAST_RESET_DAY  = None
+OPEN_SENT = False
+CLOSE_SENT = False
 
-# ================== MARKET OPEN / CLOSE ==================
+MARKET_OPEN  = time(10, 0)
+MARKET_CLOSE = time(14, 30)
+
+# ============== MARKET NOTIFICATIONS ==============
 def check_market_notifications():
     global OPEN_SENT, CLOSE_SENT
 
-    now = datetime.now().strftime("%H:%M")
+    now = datetime.now().time()
 
-    # فتح السوق
     if now >= MARKET_OPEN and not OPEN_SENT:
-        send_telegram(
-            "🟢 EGX – Market Open\n\n"
-            "📈 تم فتح جلسة التداول\n"
-            f"⏰ {MARKET_OPEN}\n\n"
-            "📌 النظام جاهز للمتابعة"
-        )
+        send_telegram("📢 فتح سوق EGX")
         OPEN_SENT = True
 
-    # غلق السوق
     if now >= MARKET_CLOSE and not CLOSE_SENT:
-        send_telegram(
-            "🔴 EGX – Market Close\n\n"
-            "📉 تم إغلاق جلسة التداول\n"
-            f"⏰ {MARKET_CLOSE}\n\n"
-            "📌 انتهى التداول اليوم"
-        )
+        send_telegram("⏹️ إغلاق سوق EGX")
         CLOSE_SENT = True
 
-# ================== DAILY RESET ==================
-def daily_reset():
-    global OPEN_SENT, CLOSE_SENT, LAST_SIGNAL_DAY, LAST_RESET_DAY
-    today = date.today().isoformat()
-
-    if LAST_RESET_DAY != today:
-        OPEN_SENT = False
-        CLOSE_SENT = False
-        LAST_SIGNAL_DAY = None
-        LAST_RESET_DAY = today
-
-# ================== SCHEDULER THREAD ==================
-def scheduler():
-    while True:
-        daily_reset()
-        check_market_notifications()
-        time.sleep(30)
-
-threading.Thread(target=scheduler, daemon=True).start()
-
-# ================== WEBHOOK (11:45 SIGNAL) ==================
+# ============== WEBHOOK =================
 @app.route("/webhook", methods=["POST"])
 def webhook():
     global LAST_SIGNAL_DAY
@@ -81,51 +44,51 @@ def webhook():
     if LAST_SIGNAL_DAY == today:
         return {"status": "duplicate"}
 
-    d = request.get_json(silent=True)
-    if not d:
-        return {"status": "no_data"}
+    data = request.get_json()
+
+    ema20 = float(data["ema20"])
+    ema50 = float(data["ema50"])
+    rsi   = float(data["rsi"])
+    volr  = float(data["volr"])
+    high  = float(data["high"])
+    low   = float(data["low"])
+    close = float(data["close"])
 
     notes = []
     score = 0
 
-    # ===== Trend =====
-    if d.get("ema20", 0) > d.get("ema50", 0):
-        notes.append("الاتجاه قصير الأجل: مستقر")
+    # Trend
+    if ema20 > ema50:
+        notes.append("الاتجاه قصير الأجل إيجابي")
         score += 1
     else:
-        notes.append("الاتجاه قصير الأجل: ضعيف")
+        notes.append("الاتجاه قصير الأجل ضعيف")
         score -= 1
 
-    # ===== RSI =====
-    rsi = d.get("rsi", 50)
+    # RSI
     if rsi > 45:
-        notes.append("الزخم: إيجابي")
+        notes.append("الزخم إيجابي")
         score += 1
     elif rsi < 40:
-        notes.append("الزخم: سلبي")
+        notes.append("الزخم سلبي")
         score -= 1
 
-    # ===== Volume =====
-    volr = d.get("volr", 1)
+    # Volume
     if volr > 1.3:
-        notes.append("السيولة: توزيع ملحوظ")
+        notes.append("سيولة توزيعية")
         score -= 1
     else:
-        notes.append("السيولة: طبيعية")
+        notes.append("السيولة طبيعية")
 
-    # ===== Close behavior =====
-    high  = d.get("high", 0)
-    low   = d.get("low", 0)
-    close = d.get("close", 0)
-
+    # Close behavior
     rng = high - low
     if rng > 0 and (close - low) / rng < 0.3:
-        notes.append("الإغلاق: قريب من القاع")
+        notes.append("الإغلاق قريب من القاع")
         score -= 1
     else:
-        notes.append("الإغلاق: متماسك")
+        notes.append("الإغلاق متماسك")
 
-    # ===== Final Decision =====
+    # Decision
     if score <= -2:
         decision = "🔴 بيع وحدات صندوق بلتون 100 اليوم"
         outlook  = "احتمال هبوط غدًا مرتفع"
@@ -144,11 +107,13 @@ def webhook():
 
     return {"status": "ok"}
 
-# ================== RUN APP ==================
-import os
+# ============== HEALTH CHECK ==============
+@app.route("/")
+def health():
+    check_market_notifications()
+    return "EGX100 Bot Running"
 
+# ============== RUN =================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
-
